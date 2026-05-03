@@ -1,0 +1,141 @@
+name: Full Stack - XFCE RDP + Ngrok + Ollama + AnythingLLM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      USERNAME: runner
+      PASSWORD: runner
+      OLLAMA_MODEL: llama3.2:1b
+      ANYTHINGLLM_PORT: 3001
+      STORAGE_DIR: /home/runner/anythingllm_data
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- RDP (XFCE) ----------
+      - name: Install XFCE and xrdp
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xorg dbus-x11 xrdp
+          echo "startxfce4" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      - name: Set user password and sudo
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      # ---------- Docker ----------
+      - name: Install Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker ${USERNAME}
+          sudo systemctl start docker
+
+      # ---------- Ollama (native, listen all interfaces) ----------
+      - name: Install and configure Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+          echo -e "[Service]\nEnvironment=OLLAMA_HOST=0.0.0.0:11434" | sudo tee /etc/systemd/system/ollama.service.d/override.conf
+          sudo systemctl daemon-reload
+          sudo systemctl start ollama
+          sudo systemctl enable ollama
+          sleep 5
+          ollama pull ${OLLAMA_MODEL}
+          ollama list
+
+      # ---------- AnythingLLM (Docker) ----------
+      - name: Deploy AnythingLLM
+        run: |
+          sudo mkdir -p ${STORAGE_DIR}
+          sudo chown -R 1000:1000 ${STORAGE_DIR}
+          sudo chmod -R 755 ${STORAGE_DIR}
+          docker rm -f anythingllm 2>/dev/null || true
+          docker run -d \
+            --name anythingllm \
+            -p ${ANYTHINGLLM_PORT}:3001 \
+            -e STORAGE_DIR="/app/server/storage" \
+            -v ${STORAGE_DIR}:/app/server/storage \
+            --add-host host.docker.internal:host-gateway \
+            --restart=unless-stopped \
+            mintplexlabs/anythingllm
+          # Wait for HTTP readiness
+          for i in {1..30}; do
+            if curl -s -f -o /dev/null http://localhost:${ANYTHINGLLM_PORT}; then
+              echo "AnythingLLM ready"
+              break
+            fi
+            sleep 3
+          done
+
+      # ---------- Ngrok Installation & Tunnels ----------
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -qq
+          sudo apt-get install -y ngrok
+          ngrok config add-authtoken ${NGROK_AUTH_TOKEN}
+
+      - name: Start ngrok tunnels
+        run: |
+          # TCP tunnel for RDP (port 3389)
+          ngrok tcp 3389 --log=stdout > /tmp/ngrok-rdp.log 2>&1 &
+          # HTTP tunnel for AnythingLLM (port 3001)
+          ngrok http ${ANYTHINGLLM_PORT} --log=stdout > /tmp/ngrok-web.log 2>&1 &
+          sleep 5
+          # Fetch public addresses
+          echo "Waiting for tunnels to be ready..."
+          for i in {1..15}; do
+            RDP_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url')
+            WEB_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+            if [[ -n "$RDP_URL" && -n "$WEB_URL" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "RDP_TUNNEL=$RDP_URL" >> $GITHUB_ENV
+          echo "WEB_TUNNEL=$WEB_URL" >> $GITHUB_ENV
+
+      # ---------- Connection Information ----------
+      - name: Connection Information
+        run: |
+          echo "============================================================"
+          echo "                FULL STACK IS READY (via ngrok)             "
+          echo "============================================================"
+          echo "RDP CONNECTION (use any RDP client):"
+          echo "  Address: ${RDP_TUNNEL}"
+          echo "  Username: ${USERNAME}"
+          echo "  Password: ${PASSWORD}"
+          echo ""
+          echo "ANYTHINGLLM:"
+          echo "  URL: ${WEB_TUNNEL}"
+          echo ""
+          echo "OLLAMA (local LLM):"
+          echo "  API: http://localhost:11434 (inside runner)"
+          echo "  Pre‑loaded model: ${OLLAMA_MODEL}"
+          echo ""
+          echo "Inside AnythingLLM, add Ollama with:"
+          echo "  Base URL: http://host.docker.internal:11434"
+          echo "  Model: ${OLLAMA_MODEL}"
+          echo ""
+          echo "⚠️  Ngrok free tier limits connections and changes URLs on restart."
+          echo "Workflow will stay alive until you cancel it."
+          echo "============================================================"
+
+      # ---------- Keep Alive ----------
+      - name: Keep Runner Alive
+        run: while true; do sleep 600; done
